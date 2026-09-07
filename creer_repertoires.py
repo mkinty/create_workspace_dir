@@ -1,11 +1,12 @@
 """
 Création des répertoires par code INSEE — Projet SNA
 Crée l'arborescence (Dep<xx>/<insee>/Carte, Analyse) définie dans path_manager,
-sous la racine du répertoire dossier à auditer (AUDIT_SNA_DIR) choisi par
-l'utilisateur.
+sous la racine du « Répertoire des dossiers préparés » choisi par l'utilisateur,
+puis recopie tout le contenu de ce répertoire dans le « Répertoire dossier à
+auditer ».
 py creer_repertoires.py
 """
-import os, sys, re, json, subprocess, threading, warnings, importlib
+import os, sys, re, json, shutil, subprocess, threading, warnings, importlib
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -109,16 +110,40 @@ def get_codes(text):
     return list(dict.fromkeys(re.findall(r'\b(?:2[ABab]\d{3}|\d{5})\b', text.upper())))
 
 
-def creer_repertoires(path_manager, communes, log_fn, link_fn, progress_fn):
+def _copier_contenu(source, destination, log_fn):
+    """Recopie tout le contenu de ``source`` dans ``destination``.
+
+    Copie (les originaux restent dans ``source``), arborescence fusionnée
+    avec l'existant, fichiers homonymes écrasés. Renvoie le nombre d'entrées
+    de premier niveau copiées.
+    """
+    os.makedirs(destination, exist_ok=True)
+    n = 0
+    for nom in sorted(os.listdir(source)):
+        src = os.path.join(source, nom)
+        dst = os.path.join(destination, nom)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+        n += 1
+        log_fn(f"  ↪ {nom}", "#69f0ae")
+    return n
+
+
+def creer_repertoires(path_manager, communes, log_fn, link_fn, progress_fn,
+                      dossier_audit=None):
     """Crée l'arborescence (Dep/INSEE/Carte + Analyse) pour chaque commune,
-    sous la racine AUDIT_SNA actuellement configurée dans path_manager.
+    sous la racine « Répertoire des dossiers préparés » configurée dans
+    path_manager (paramètre ``audit_sna``), puis recopie tout le contenu de
+    cette racine dans ``dossier_audit`` (« Répertoire dossier à auditer »).
 
     `link_fn(path)` est appelé pour chaque dossier créé afin que l'appelant
     puisse en afficher un accès rapide (raccourci cliquable) dans le journal.
     """
     try:
         racine = path_manager.verifier_racine_audit_sna()
-        log_fn(f"📁 Répertoire dossier à auditer :", "#90caf9")
+        log_fn(f"📁 Répertoire des dossiers préparés :", "#90caf9")
         link_fn(racine)
     except OSError as e:
         log_fn(f"❌ {e}", "#ef5350")
@@ -145,6 +170,25 @@ def creer_repertoires(path_manager, communes, log_fn, link_fn, progress_fn):
         log_fn(f"🎉 {n_ok}/{len(communes)} dossier(s) créé(s)", "#69f0ae")
     else:
         log_fn("❌ Aucun dossier créé", "#ef5350")
+
+    # ── Recopie du contenu vers le « Répertoire dossier à auditer » ──
+    if n_ok:
+        log_fn(f"\n{'─'*45}", "#78909c")
+        if not dossier_audit:
+            log_fn("⚠️ « Répertoire dossier à auditer » non renseigné — copie ignorée.",
+                   "#ffb74d")
+        elif os.path.abspath(dossier_audit) == os.path.abspath(racine):
+            log_fn("ℹ️ Source et destination identiques — copie ignorée.", "#ffb74d")
+        else:
+            progress_fn(len(communes), len(communes), "Copie vers le répertoire à auditer...")
+            log_fn("📤 Copie du contenu vers le répertoire dossier à auditer…", "#90caf9")
+            try:
+                n_cop = _copier_contenu(racine, dossier_audit, log_fn)
+                log_fn(f"✅ {n_cop} élément(s) copié(s) dans :", "#69f0ae")
+                link_fn(dossier_audit)
+            except OSError as e:
+                log_fn(f"❌ Copie impossible : {e}", "#ef5350")
+
     return n_ok
 
 
@@ -161,14 +205,18 @@ def _load_path_settings(path_manager):
         return {}
 
 
-def _save_path_settings(path_manager, audit_sna):
+def _save_path_settings(path_manager, audit_sna, dossiers_prepares="", workspace=""):
     fichier = path_manager.CONFIG_FILE
     try:
         with open(fichier, encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
         data = {}
-    data[_SETTINGS_KEY] = {"audit_sna": audit_sna}
+    data[_SETTINGS_KEY] = {
+        "audit_sna": audit_sna,
+        "dossiers_prepares": dossiers_prepares,
+        "workspace": workspace,
+    }
     os.makedirs(os.path.dirname(fichier), exist_ok=True)
     with open(fichier, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -179,7 +227,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Création des répertoires — Projet SNA")
-        self.geometry("680x700")
+        self.geometry("680x820")
         self.configure(bg="#0f1117")
         self.path_manager = None
         self._link_counter = 0
@@ -204,16 +252,43 @@ class App(tk.Tk):
     # -- Paramètre du répertoire à auditer --------------------------------
     def _appliquer_config_sauvegardee(self):
         saved = _load_path_settings(self.path_manager)
-        self.ent_audit.delete(0, tk.END)
-        self.ent_audit.insert(0, saved.get("audit_sna", ""))
+        for entry, cle in ((self.ent_audit, "audit_sna"),
+                           (self.ent_dossiers_prepares, "dossiers_prepares"),
+                           (self.ent_workspace, "workspace")):
+            entry.delete(0, tk.END)
+            entry.insert(0, saved.get(cle, ""))
         if saved:
-            self.path_manager.set_paths(audit_sna=saved.get("audit_sna") or None)
+            self._appliquer_chemins(
+                dossiers_prepares=saved.get("dossiers_prepares"),
+                workspace=saved.get("workspace"),
+            )
+
+    def _appliquer_chemins(self, dossiers_prepares=None, workspace=None):
+        """Pousse les chemins dans path_manager.
+
+        Le « Répertoire des dossiers préparés » est la racine de CRÉATION :
+        il alimente le paramètre ``audit_sna`` de path_manager, sur lequel
+        s'appuient ``_insee_carte_path`` / ``_insee_analyse_path``. Le
+        « Répertoire dossier à auditer » n'est pas transmis ici : il ne sert
+        que de destination à la recopie finale.
+        """
+        self.path_manager.set_paths(
+            audit_sna=(dossiers_prepares or None),
+            workspace=(workspace or None),
+        )
 
     def _update_placeholder(self):
         if self.path_manager is None:
             self.lbl_audit_def.config(text="")
+            self.lbl_dossiers_prepares_def.config(text="")
+            self.lbl_workspace_def.config(text="")
             return
-        self.lbl_audit_def.config(text=f"Par défaut : {self.path_manager.default_audit_sna_path()}")
+        self.lbl_dossiers_prepares_def.config(
+            text=f"Par défaut : {os.path.join(self.path_manager.BUREAU, 'DOSSIERS_PREPARES')}")
+        self.lbl_audit_def.config(
+            text=f"Par défaut : {self.path_manager.default_audit_sna_path()}")
+        self.lbl_workspace_def.config(
+            text=f"Par défaut : {self.path_manager.default_workspace_path()}")
 
     def _parcourir(self, entry):
         dossier = filedialog.askdirectory()
@@ -226,10 +301,12 @@ class App(tk.Tk):
             messagebox.showerror("Erreur", "path_manager n'est pas chargé. "
                                             "Utilisez d'abord « 📁 Localiser path_manager… ».")
             return
-        audit_sna = self.ent_audit.get().strip()
-        self.path_manager.set_paths(audit_sna=audit_sna or None)
+        audit_sna         = self.ent_audit.get().strip()
+        dossiers_prepares = self.ent_dossiers_prepares.get().strip()
+        workspace         = self.ent_workspace.get().strip()
+        self._appliquer_chemins(dossiers_prepares=dossiers_prepares, workspace=workspace)
         try:
-            _save_path_settings(self.path_manager, audit_sna)
+            _save_path_settings(self.path_manager, audit_sna, dossiers_prepares, workspace)
         except Exception as e:
             messagebox.showerror("Erreur", f"Impossible d'enregistrer les paramètres :\n{e}")
             return
@@ -238,10 +315,12 @@ class App(tk.Tk):
 
     def _reinitialiser_parametres(self):
         self.ent_audit.delete(0, tk.END)
+        self.ent_dossiers_prepares.delete(0, tk.END)
+        self.ent_workspace.delete(0, tk.END)
         if self.path_manager is not None:
             self.path_manager.reset_paths()
             try:
-                _save_path_settings(self.path_manager, "")
+                _save_path_settings(self.path_manager, "", "", "")
             except Exception:
                 pass
         self._update_placeholder()
@@ -258,7 +337,9 @@ class App(tk.Tk):
 
         tk.Label(body,
                  text="Colle les codes INSEE des communes : crée pour chacune\n"
-                      "l'arborescence Dep<xx>/<insee>/Carte et /Analyse.",
+                      "l'arborescence Dep<xx>/<insee>/Carte et /Analyse dans le\n"
+                      "« Répertoire des dossiers préparés », puis recopie tout son\n"
+                      "contenu dans le « Répertoire dossier à auditer ».",
                  bg="#0f1117", fg="#78909c", font=("Segoe UI", 10),
                  justify="left").pack(anchor="w", pady=(0, 10))
 
@@ -278,8 +359,14 @@ class App(tk.Tk):
                                 labelanchor="nw", font=("Segoe UI", 9, "bold"))
         params.pack(fill="x", pady=(0, 14))
 
-        self.ent_audit     = self._champ_chemin(params, "Répertoire dossier à auditer :")
-        self.lbl_audit_def = self._label_defaut(params)
+        self.ent_dossiers_prepares     = self._champ_chemin(params, "Répertoire des dossiers préparés :")
+        self.lbl_dossiers_prepares_def = self._label_defaut(params)
+
+        self.ent_audit                 = self._champ_chemin(params, "Répertoire dossier à auditer :")
+        self.lbl_audit_def             = self._label_defaut(params)
+
+        self.ent_workspace             = self._champ_chemin(params, "Répertoire de travail :")
+        self.lbl_workspace_def         = self._label_defaut(params)
 
         btn_row = tk.Frame(params, bg="#0f1117")
         btn_row.pack(fill="x", padx=10, pady=(6, 10))
@@ -400,13 +487,23 @@ class App(tk.Tk):
             messagebox.showwarning("Erreur", "Aucun code commune valide détecté.")
             return
 
-        # Applique le chemin actuellement saisi dans le champ, même si
+        # Applique les chemins actuellement saisis dans les champs, même si
         # « Enregistrer les paramètres » n'a pas été cliqué explicitement.
-        audit_sna = self.ent_audit.get().strip()
-        self.path_manager.set_paths(audit_sna=audit_sna or None)
+        audit_sna         = self.ent_audit.get().strip()
+        dossiers_prepares = self.ent_dossiers_prepares.get().strip()
+        workspace         = self.ent_workspace.get().strip()
+        if not dossiers_prepares:
+            messagebox.showwarning(
+                "Erreur", "Renseignez le « Répertoire des dossiers préparés » "
+                          "(racine de création des dossiers).")
+            return
+        self._appliquer_chemins(dossiers_prepares=dossiers_prepares, workspace=workspace)
 
+        dest = audit_sna or "(non renseigné — copie ignorée)"
         if not messagebox.askyesno("Confirmation",
-                f"Créer les répertoires pour {len(codes)} commune(s) ?"):
+                f"Créer les répertoires pour {len(codes)} commune(s) dans :\n"
+                f"{dossiers_prepares}\n\n"
+                f"puis recopier le contenu dans :\n{dest} ?"):
             return
 
         self.txt_log.config(state="normal"); self.txt_log.delete("1.0", tk.END)
@@ -415,7 +512,8 @@ class App(tk.Tk):
 
         def do():
             self._log(f"🚀 Création des répertoires pour {len(codes)} commune(s)...", "#90caf9")
-            n = creer_repertoires(self.path_manager, codes, self._log, self._log_link, self._prog)
+            n = creer_repertoires(self.path_manager, codes, self._log, self._log_link,
+                                  self._prog, dossier_audit=audit_sna or None)
             self.btn.config(state="normal")
             if n > 0:
                 messagebox.showinfo("Terminé", f"✅ {n} dossier(s) créé(s) !")
